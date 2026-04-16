@@ -469,6 +469,8 @@ void MoonrakerPrinterAgent::build_ams_payload(int ams_count, int max_lane_index,
     unsigned long ams_exist_bits = 0;
     unsigned long tray_exist_bits = 0;
 
+    BOOST_LOG_TRIVIAL(info) << "Assembling AMS payload:";
+
     for (int ams_id = 0; ams_id < ams_count; ++ams_id) {
         ams_exist_bits |= (1 << ams_id);
 
@@ -514,7 +516,7 @@ void MoonrakerPrinterAgent::build_ams_payload(int ams_count, int max_lane_index,
                 tray_json["tray_color"] = "00000000";
                 tray_json["tray_slot_placeholder"] = "1";
             }
-
+            BOOST_LOG_TRIVIAL(info) << "Tray " << slot_id << " tray_info_idx " << tray_json["tray_info_idx"] << " tray_type " << tray_json["tray_type"] << " tray_color "<< tray_json["tray_color"];
             tray_array.push_back(tray_json);
         }
         ams_unit["tray"] = tray_array;
@@ -571,7 +573,18 @@ bool MoonrakerPrinterAgent::fetch_filament_info(std::string dev_id)
     std::vector<AmsTrayData> trays;
     int max_lane_index = 0;
 
-    // Try Happy Hare first (more widely adopted, supports more filament changers)
+    // Try Moonraker filament data (more generic, supports any filament changer
+    // software that reports lane data to Moonraker like AFC and recent Happy
+    // Hare as of Feb 15, 2026)
+    if (fetch_moonraker_filament_data(trays, max_lane_index)) {
+        BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent::fetch_filament_info: Detected Moonraker filament system with "
+                                << (max_lane_index + 1) << " lanes";
+        int ams_count = (max_lane_index + 4) / 4;
+        build_ams_payload(ams_count, max_lane_index, trays);
+        return true;
+    }
+
+    // Attempt Happy Hare first (more widely adopted, supports more filament changers)
     if (fetch_hh_filament_info(trays, max_lane_index)) {
         BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent::fetch_filament_info: Detected Happy Hare MMU with "
                                 << (max_lane_index + 1) << " gates";
@@ -580,17 +593,8 @@ bool MoonrakerPrinterAgent::fetch_filament_info(std::string dev_id)
         return true;
     }
 
-    // Fallback to AFC
-    if (fetch_afc_filament_info(trays, max_lane_index)) {
-        BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent::fetch_filament_info: Detected AFC with "
-                                << (max_lane_index + 1) << " lanes";
-        int ams_count = (max_lane_index + 4) / 4;
-        build_ams_payload(ams_count, max_lane_index, trays);
-        return true;
-    }
-
     // No MMU detected - this is normal for printers without MMU, not an error
-    BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent::fetch_filament_info: No MMU system detected (neither HH nor AFC)";
+    BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent::fetch_filament_info: No MMU system detected (neither HH nor Moonraker)";
     return false;
 }
 
@@ -721,10 +725,10 @@ std::string MoonrakerPrinterAgent::normalize_color_value(const std::string& colo
     return normalized;
 }
 
-// Fetch filament info from Armored Turtle AFC
-bool MoonrakerPrinterAgent::fetch_afc_filament_info(std::vector<AmsTrayData>& trays, int& max_lane_index)
+// Fetch filament info from moonraker database
+bool MoonrakerPrinterAgent::fetch_moonraker_filament_data(std::vector<AmsTrayData>& trays, int& max_lane_index)
 {
-    // Fetch AFC lane data from Moonraker database
+    // Fetch lane data from Moonraker database
     std::string url = join_url(device_info.base_url, "/server/database/item?namespace=lane_data");
 
     std::string response_body;
@@ -754,19 +758,19 @@ bool MoonrakerPrinterAgent::fetch_afc_filament_info(std::vector<AmsTrayData>& tr
         .perform_sync();
 
     if (!success) {
-        BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent::fetch_afc_filament_info: Failed to fetch lane data: " << http_error;
+        BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent::fetch_moonraker_filament_data: Failed to fetch lane data: " << http_error;
         return false;
     }
 
     auto json = nlohmann::json::parse(response_body, nullptr, false, true);
     if (json.is_discarded()) {
-        BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent::fetch_afc_filament_info: Invalid JSON response";
+        BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent::fetch_moonraker_filament_data: Invalid JSON response";
         return false;
     }
 
     // Expected structure: { "result": { "namespace": "lane_data", "value": { "lane1": {...}, ... } } }
     if (!json.contains("result") || !json["result"].contains("value") || !json["result"]["value"].is_object()) {
-        BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent::fetch_afc_filament_info: Unexpected JSON structure or no lane_data found";
+        BOOST_LOG_TRIVIAL(warning) << "MoonrakerPrinterAgent::fetch_moonraker_filament_data: Unexpected JSON structure or no lane_data found";
         return false;
     }
 
@@ -803,16 +807,74 @@ bool MoonrakerPrinterAgent::fetch_afc_filament_info(std::vector<AmsTrayData>& tr
         tray.nozzle_temp = safe_json_int(lane_obj, "nozzle_temp");
         tray.has_filament = !tray.tray_type.empty();
         auto* bundle = GUI::wxGetApp().preset_bundle;
-        tray.tray_info_idx = bundle
-            ? bundle->filaments.filament_id_by_type(tray.tray_type)
-            : map_filament_type_to_generic_id(tray.tray_type);
+        bool prefer_custom = GUI::wxGetApp().app_config->get("filament_sync_prefer_custom") == "true";
+        size_t internal_idx = size_t(-1);
+        BOOST_LOG_TRIVIAL(debug) << "Filament sync: Looking for profile for material type " << tray.tray_type;
+        if (bundle) {
 
+            if (tray.tray_type.empty()) {
+                tray.tray_info_idx = "";
+                BOOST_LOG_TRIVIAL(debug) << "Filament sync: Tray " << lane_index << " is empty. Skipping search.";
+            }
+
+            if (prefer_custom == true) {
+                internal_idx = bundle->filaments.first_visible_idx_by_type(tray.tray_type,true,true);
+
+                // if profile found, verify it has correct material ID
+                if (internal_idx != size_t(-1)) {
+                    const auto& p = bundle->filaments.preset(internal_idx);
+                    std::string generic_id = map_filament_type_to_generic_id(tray.tray_type);
+
+                    if (p.filament_id != generic_id &&
+                        p.filament_id != "O" + generic_id &&
+                        generic_id != "O" + p.filament_id)
+                    {
+                        BOOST_LOG_TRIVIAL(debug) << "Filament sync: Profile " << p.name << " has mismatched ID (" << p.filament_id
+                        << ", should be " << generic_id << "). Not using.";
+                        internal_idx = size_t(-1);
+                    } else {
+                        tray.tray_info_idx = p.filament_id;
+                        BOOST_LOG_TRIVIAL(debug) << "Filament sync: Found user profile " << p.name;
+                        tray.tray_type = p.config.opt_string("filament_type", 0u);
+                    }
+                }
+            }
+
+            if (internal_idx == size_t(-1)) {
+                internal_idx = bundle->filaments.first_visible_idx_by_type(tray.tray_type,false,true);
+
+                if (internal_idx != size_t(-1)) {
+                    const auto& p = bundle->filaments.preset(internal_idx);
+                    std::string generic_id = map_filament_type_to_generic_id(tray.tray_type);
+                    BOOST_LOG_TRIVIAL(debug) << "Filament sync: Found manufacturer-specific profile " << p.name;
+                    tray.tray_info_idx = p.filament_id;
+                    tray.tray_type = p.config.opt_string("filament_type", 0u);
+                }
+
+            }
+
+            if (internal_idx == size_t(-1)) {
+                internal_idx = bundle->filaments.first_visible_idx_by_type(tray.tray_type,false,false);
+
+                if (internal_idx != size_t(-1)) {
+                    const auto& p = bundle->filaments.preset(internal_idx);
+                    std::string generic_id = map_filament_type_to_generic_id(tray.tray_type);
+                    BOOST_LOG_TRIVIAL(warning) << "Filament sync: Found manufacturer-specific profile " << p.name;
+                    tray.tray_info_idx = p.filament_id;
+                    tray.tray_type = p.config.opt_string("filament_type", 0u);
+                }
+            }
+
+        } else {
+            // if bundle can't be loaded at all
+            tray.tray_info_idx = map_filament_type_to_generic_id(tray.tray_type);
+        }
         max_lane_index = std::max(max_lane_index, lane_index);
         trays.push_back(tray);
     }
 
     if (trays.empty()) {
-        BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent::fetch_afc_filament_info: No AFC lanes found";
+        BOOST_LOG_TRIVIAL(info) << "MoonrakerPrinterAgent::fetch_moonraker_filament_data: No lanes found";
         return false;
     }
 
@@ -931,12 +993,71 @@ bool MoonrakerPrinterAgent::fetch_hh_filament_info(std::vector<AmsTrayData>& tra
         tray.has_filament = true;
 
         auto* bundle = GUI::wxGetApp().preset_bundle;
-        tray.tray_info_idx = bundle
-            ? bundle->filaments.filament_id_by_type(tray.tray_type)
-            : map_filament_type_to_generic_id(tray.tray_type);
+        bool prefer_custom = GUI::wxGetApp().app_config->get("filament_sync_prefer_custom") == "true";
+        size_t internal_idx = size_t(-1);
+        if (bundle) {
+
+            if (tray.tray_type.empty()) {
+                tray.tray_info_idx = "";
+                BOOST_LOG_TRIVIAL(debug) << "Filament sync: Tray " << gate_idx << " is empty. Skipping search.";
+            }
+
+            if (prefer_custom == true) {
+                internal_idx = bundle->filaments.first_visible_idx_by_type(tray.tray_type,true,true);
+
+                // if profile found, verify it has correct material ID
+                if (internal_idx != size_t(-1)) {
+                    const auto& p = bundle->filaments.preset(internal_idx);
+                    std::string generic_id = map_filament_type_to_generic_id(tray.tray_type);
+
+                    if (p.filament_id != generic_id &&
+                        p.filament_id != "O" + generic_id &&
+                        generic_id != "O" + p.filament_id)
+                    {
+                        BOOST_LOG_TRIVIAL(debug) << "Filament sync: Profile " << p.name << " has mismatched ID (" << p.filament_id
+                        << ", should be " << generic_id << "). Not using.";
+                        internal_idx = size_t(-1);
+                    } else {
+                        tray.tray_info_idx = p.filament_id;
+                        BOOST_LOG_TRIVIAL(debug) << "Filament sync: Found user profile " << p.name;
+                        tray.tray_type = p.config.opt_string("filament_type", 0u);
+                    }
+                }
+            }
+
+            if (internal_idx == size_t(-1)) {
+                internal_idx = bundle->filaments.first_visible_idx_by_type(tray.tray_type,false,true);
+
+                if (internal_idx != size_t(-1)) {
+                    const auto& p = bundle->filaments.preset(internal_idx);
+                    std::string generic_id = map_filament_type_to_generic_id(tray.tray_type);
+                    BOOST_LOG_TRIVIAL(debug) << "Filament sync: Found manufacturer-specific profile " << p.name;
+                    tray.tray_info_idx = p.filament_id;
+                    tray.tray_type = p.config.opt_string("filament_type", 0u);
+                }
+
+            }
+
+            if (internal_idx == size_t(-1)) {
+                internal_idx = bundle->filaments.first_visible_idx_by_type(tray.tray_type,false,false);
+
+                if (internal_idx != size_t(-1)) {
+                    const auto& p = bundle->filaments.preset(internal_idx);
+                    std::string generic_id = map_filament_type_to_generic_id(tray.tray_type);
+                    BOOST_LOG_TRIVIAL(warning) << "Filament sync: Found manufacturer-specific profile " << p.name;
+                    tray.tray_info_idx = p.filament_id;
+                    tray.tray_type = p.config.opt_string("filament_type", 0u);
+                }
+            }
+
+        } else {
+            // if bundle can't be loaded at all
+            tray.tray_info_idx = map_filament_type_to_generic_id(tray.tray_type);
+        }
 
         max_lane_index = std::max(max_lane_index, gate_idx);
         trays.push_back(tray);
+
     }
 
     if (trays.empty()) {
